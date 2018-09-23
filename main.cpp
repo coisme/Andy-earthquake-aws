@@ -8,6 +8,7 @@
 #include "MQTT_server_setting.h"
 #include "mbed-trace/mbed_trace.h"
 #include "mbed_events.h"
+#include "mbedtls/error.h"
 
 #include "SingletonFXOS8700CQ.h"
 
@@ -16,18 +17,24 @@
 
 static volatile bool isPublish = false;
 
+/* Flag to be set when received a message from the server. */
+static volatile bool isMessageArrived = false;
+/* Buffer size for a receiving message. */
+const int MESSAGE_BUFFER_SIZE = 1024;
+/* Buffer for a receiving message. */
+char messageBuffer[MESSAGE_BUFFER_SIZE];
+
 /*
  * Callback function called when a message arrived from server.
  */
 void messageArrived(MQTT::MessageData& md)
 {
-    /* TODO: Move printf to outside interrupt context. */
+    // Copy payload to the buffer.
     MQTT::Message &message = md.message;
-    printf("\r\n");
-    printf("! Message arrived: qos %d, retained %d, dup %d, packetid %d\r\n",
-            message.qos, message.retained, message.dup, message.id);
-    printf("! Payload %.*s\r\n", message.payloadlen, (char*)message.payload);
-    printf("\r\n");
+    memcpy(messageBuffer, message.payload, message.payloadlen);
+    messageBuffer[message.payloadlen] = '\0';
+
+    isMessageArrived = true;
 }
 
 void btn1_rise_handler() {
@@ -86,6 +93,8 @@ void calibrate(double *pmean, double *pdeviation)
     printf("Calibration complete - mean=%f; devation=%f\r\n", *pmean, *pdeviation);
 }
 
+void measure(double mean)
+
 int main(int argc, char* argv[])
 {
     mbed_trace_init();
@@ -106,7 +115,6 @@ int main(int argc, char* argv[])
 
     printf("Opening network interface...\r\n");
     {
-//        network = easy_connect(true);    // If true, prints out connection details.
         network = NetworkInterface::get_default_instance();
         if (!network) {
             printf("Unable to open network interface.\r\n");
@@ -131,8 +139,23 @@ int main(int argc, char* argv[])
     printf("\n\n\rFXOS8700CQ identity = %X\r\n", sfxos.getWhoAmI());
     //msgLock = Lock_Init();  // TODO: Check error code    
     sfxos.enable();
-    sfxos.getData(reading);
-    calibrate(&mean, &deviation);
+//    sfxos.getData(reading);
+
+    // 
+    // Accel Calibration
+    //
+    const double CALIB_PASS_THRESHOLD = 0.3; // gal
+    printf("Performing calibration...\r\n");
+    bool isCalibrationDone = false;
+    while(isCalibrationDone) {
+        calibrate(&mean, &deviation);
+        if(deviation < CALIB_PASS_THRESHOLD) {
+            printf("Calibration done. mean=%f\r\n", mean);
+            isCalibrationDone = true;
+        } else {
+            printf("Deviation is larger than threshold. Try again...\r\n");
+        }
+    }
   
     printf("Connecting to host %s:%d ...\r\n", MQTT_SERVER_HOST_NAME, MQTT_SERVER_PORT);
     {
@@ -140,8 +163,19 @@ int main(int argc, char* argv[])
         int rc = mqttNetwork->connect(MQTT_SERVER_HOST_NAME, MQTT_SERVER_PORT, SSL_CA_PEM,
                 SSL_CLIENT_CERT_PEM, SSL_CLIENT_PRIVATE_KEY_PEM);
         if (rc != MQTT::SUCCESS){
-            printf("ERROR: rc from TCP connect is %d\r\n", rc);
-            return -1;
+            const int MAX_TLS_ERROR_CODE = -0x1000;
+            // Network error
+            if((MAX_TLS_ERROR_CODE < rc) && (rc < 0)) {
+                // TODO: implement converting an error code into message.
+                printf("ERROR from MQTTNetwork connect is %d.", rc);
+            }
+            // TLS error - mbedTLS error codes starts from -0x1000 to -0x8000.
+            if(rc <= MAX_TLS_ERROR_CODE) {
+                const int buf_size = 256;
+                char *buf = new char[buf_size];
+                mbedtls_strerror(rc, buf, buf_size);
+                printf("TLS ERROR (%d) : %s\r\n", rc, buf);
+            }            return -1;
         }
     }
     printf("Connection established.\r\n");
@@ -193,6 +227,11 @@ int main(int argc, char* argv[])
         }
         if(mqttClient->yield(100) != MQTT::SUCCESS) {
             break;
+        }
+        /* Received a message. */
+        if(isMessageArrived) {
+            isMessageArrived = false;
+            printf("\r\nMessage arrived:\r\n%s\r\n", messageBuffer);
         }
         if(isPublish) {
             isPublish = false;
