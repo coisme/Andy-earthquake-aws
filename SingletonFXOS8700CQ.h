@@ -62,4 +62,5 @@ public:
     void setInt2Triggered(bool value) { fxos_int2_triggered = value; }
     uint8_t getWhoAmI() { return fxos.get_whoami(); }
     uint8_t getStatus() { return fxos.status(); }
+    uint8_t get_accel_scale() { return fxos.get_accel_scale(); }
 };
