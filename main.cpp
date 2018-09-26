@@ -118,7 +118,7 @@ int acc_calibrate() {
     sq_stdev = sq_stdev / NUM_SAMPLES;
 
     const float THRESHOLD = 1.5;   // GAL (tentative) - 0.3 gal might be too tight for FXOS8700CQ?
-    float val = acc_conv_raw_to_gal(sqrt(sq_stdev)); // GAL
+    float val = acc_conv_raw_to_gal(sqrt(((float)sq_stdev))); // GAL
     if(val < THRESHOLD){
         ret = 0;
         mean_ax = (int16_t)buf_mean_ax;
@@ -342,7 +342,7 @@ int main(int argc, char* argv[])
 
             message.qos = MQTT::QOS0;
             message.id = id++;
-            sprintf(buf, "%ld,%f", ntp.get_timestamp(), acc_conv_raw_to_gal(sqrt(report_sq_vector_size)));
+            sprintf(buf, "%ld,%f", ntp.get_timestamp(), acc_conv_raw_to_gal(sqrt((float)report_sq_vector_size)));
             message.payloadlen = strlen(buf)+1;
             // Publish a message.
             printf("Publishing message.\r\n");
