@@ -48,13 +48,103 @@ void messageArrived(MQTT::MessageData& md)
  */
 int16_t mean_ax = 0;  // to be calibrated
 int16_t mean_ay = 0;  // to be calibrated
-int16_t stdev = 0;    // to be calibrated
 
-uint32_t report_vector_size = 0;
+
+/**
+ * Converts raw data value in LSB to gal.
+ * @param raw_val Raw data value in LSB unit.
+ * @return The value in gal.
+ */
+float acc_conv_raw_to_gal(int16_t raw_val) {
+    static float sensitivity = 0;
+    if(sensitivity == 0) {
+        SingletonFXOS8700CQ &sfxos = SingletonFXOS8700CQ::getInstance();
+        uint8_t full_scale = sfxos.get_accel_scale(); // G
+        int16_t resolution = 16384;    // 2^14, accelerometer resolution
+        sensitivity = full_scale / (float)resolution;   // G per LSB
+    }
+    const float CONV_G_TO_GAL = 980.665;  // 1G = 980.665 gal
+
+    return (raw_val*CONV_G_TO_GAL*sensitivity);
+}
+
+/**
+ * Calibrates the accelerometer.
+ * @return 0 on success, other values on error.
+ */
+int acc_calibrate() {
+    int ret = 0;
+    const int SAMPLING_FREQ = 50; // Hz
+    const int SAMPLE_TIME = 10;   // seconds
+    const int NUM_SAMPLES = SAMPLING_FREQ * SAMPLE_TIME;
+
+    // Get memory in heap ~ 2kB, don't forget to delete.
+    int16_t *ax = new int16_t[NUM_SAMPLES];
+    int16_t *ay = new int16_t[NUM_SAMPLES];
+
+    int i = NUM_SAMPLES;
+
+    READING reading;
+    SingletonFXOS8700CQ &sfxos = SingletonFXOS8700CQ::getInstance();
+
+    int32_t buf_mean_ax = 0;
+    int32_t buf_mean_ay = 0;
+
+    while(i > 0) {
+        if (sfxos.getInt2Triggered()){
+            sfxos.setInt2Triggered(false);
+            if(sfxos.getData(reading) == 0){
+                i--;
+                ax[i] = reading.accelerometer.x;
+                ay[i] = reading.accelerometer.y;
+                buf_mean_ax += ax[i];
+                buf_mean_ay += ay[i];
+            }
+        }
+        // wait 20 milli-seconds, roughly 50 Hz -- not accurate
+        wait_ms(20);
+    }
+
+    buf_mean_ax = buf_mean_ax / NUM_SAMPLES;
+    buf_mean_ay = buf_mean_ay / NUM_SAMPLES;
+
+    // Calculates the square of standard deviation
+    int32_t sq_stdev = 0;
+    for(i=0; i < NUM_SAMPLES; i++) {
+        int32_t dx = ax[i] - buf_mean_ax;
+        int32_t dy = ay[i] - buf_mean_ay;
+        sq_stdev += dx * dx + dy * dy;
+    }
+    sq_stdev = sq_stdev / NUM_SAMPLES;
+
+    const float THRESHOLD = 1.5;   // GAL (tentative) - 0.3 gal might be too tight for FXOS8700CQ?
+    float val = acc_conv_raw_to_gal(sqrt(sq_stdev)); // GAL
+    if(val < THRESHOLD){
+        ret = 0;
+        mean_ax = (int16_t)buf_mean_ax;
+        mean_ay = (int16_t)buf_mean_ay;
+        printf("OFFSET AX=%d LSB (%f gal), AY=%d LSB (%f gal)\r\n", 
+            mean_ax, acc_conv_raw_to_gal(mean_ax), 
+            mean_ay, acc_conv_raw_to_gal(mean_ay));
+    } else {
+        ret = -1;
+        printf("Deviation %f exceeds the threshold %f gal. Try calibration again.\r\n", val, THRESHOLD);
+    }
+
+    delete[] ax;
+    delete[] ay;
+
+    return ret;
+}
+
+// The square of the size of acceleration vector. Published to the server.
+uint32_t report_sq_vector_size = 0; 
+
 /**
  * Measures acceleration and calculates holizontal size of acc vector. Called every 20 msec.
  */
-int measure() {
+int acc_measure() {
+    // Once count reaches this value, data is sent to the server.
     const int REPORT_COUNT = 50;
 
     static int count = 0;
@@ -75,7 +165,7 @@ int measure() {
         count++;
         if(count >= REPORT_COUNT) {
             count = 0;
-            report_vector_size = max_vector_size;
+            report_sq_vector_size = max_vector_size;
             max_vector_size = 0;
             isPublish = true;
         }
@@ -87,6 +177,7 @@ int measure() {
     return 0;
 }
 
+
 int main(int argc, char* argv[])
 {
     mbed_trace_init();
@@ -94,6 +185,11 @@ int main(int argc, char* argv[])
     const float version = 0.8;
     bool isSubscribed = false;
 
+    ///////////////////////////////////////////////////
+    //
+    // Network setting
+    //
+    ///////////////////////////////////////////////////
     NetworkInterface* network = NULL;
     MQTTNetwork* mqttNetwork = NULL;
     MQTT::Client<MQTTNetwork, Countdown>* mqttClient = NULL;
@@ -187,26 +283,34 @@ int main(int argc, char* argv[])
     printf("Client has subscribed a topic \"%s\".\r\n", MQTT_TOPIC_SUB);
     printf("\r\n");
 
+    ///////////////////////////////////////////////////
     //
-    // Accelerometer
+    // Accelerometer setting
     //
+    ///////////////////////////////////////////////////
     SingletonFXOS8700CQ &sfxos = SingletonFXOS8700CQ::getInstance();
     // Check the connection to the accelerometer
     printf("\n\n\rFXOS8700CQ identity = %X\r\n", sfxos.getWhoAmI());
     // Enable the accelerometer
     sfxos.enable();
 
+    // Calibration, only init time at the moment.
+    printf("Calibrating...\r\n");
+    while(acc_calibrate() != 0);
+    printf("Calibration done.\r\n");
+
     // Call measure() every 20 milli-seconds.
     Ticker ticker;
-    ticker.attach(eventQueue.event(&measure), 0.02);
+    ticker.attach(eventQueue.event(&acc_measure), 0.02);
 
     // Start the event queue in a separate thread so the main thread continues
     thread1.start(callback(&eventQueue, &EventQueue::dispatch_forever));
 
-
+    ///////////////////////////////////////////////////
     //
     // Main loop
     //
+    ///////////////////////////////////////////////////
     while(1) {
         if(!mqttClient->isConnected()){
             break;
@@ -238,13 +342,15 @@ int main(int argc, char* argv[])
 
             message.qos = MQTT::QOS0;
             message.id = id++;
-            sprintf(buf, "%ld,%ld", ntp.get_timestamp(), report_vector_size);
+            sprintf(buf, "%ld,%f", ntp.get_timestamp(), acc_conv_raw_to_gal(sqrt(report_sq_vector_size)));
             message.payloadlen = strlen(buf)+1;
             // Publish a message.
             printf("Publishing message.\r\n");
             int rc = mqttClient->publish(MQTT_TOPIC_PUB, message);
             if(rc != MQTT::SUCCESS) {
                 printf("ERROR: rc from MQTT publish is %d\r\n", rc);
+            } else {
+                printf("%s\r\n", buf);
             }
             printf("Message published.\r\n");
             delete[] buf;    
@@ -253,6 +359,11 @@ int main(int argc, char* argv[])
         }
     }
 
+    ///////////////////////////////////////////////////
+    //
+    // Terminate
+    //
+    ///////////////////////////////////////////////////
     printf("The client has disconnected.\r\n");
 
     if(mqttClient) {
